@@ -51,3 +51,5 @@ Descriptor format is 128-bit, with fields for length, address, and next pointer.
 Register map is minimal and easily extensible.
 
 Can be used standalone on FPGA or integrated into SoCs with AXI interconnect.
+<img width="1536" height="1024" alt="image_DMA" src="https://github.com/user-attachments/assets/7e2cb3cb-6a75-4ca4-b3eb-2b00241d929a" />
+

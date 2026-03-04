@@ -1,29 +1,39 @@
-// pulse_sync.v
-module pulse_sync (
-    input  wire clk_dst,
-    input  wire rst_n,
-    input  wire pulse_in,
-    output reg  pulse_out
-);
-    reg sync1, sync2;
-    reg flag;
+-- pulse_sync.vhd
+library ieee;
+use ieee.std_logic_1164.all;
 
-    always @(posedge clk_dst or negedge rst_n) begin
-        if (!rst_n) begin
-            sync1 <= 1'b0;
-            sync2 <= 1'b0;
-            flag  <= 1'b0;
-            pulse_out <= 1'b0;
-        end else begin
-            sync1 <= pulse_in;
-            sync2 <= sync1;
-            if (sync2 & ~flag) begin
-                pulse_out <= 1'b1;
-                flag <= 1'b1;
-            end else begin
-                pulse_out <= 1'b0;
-            end
-            if (!sync2) flag <= 1'b0;
-        end
-    end
-endmodule
+entity pulse_sync is
+  port (
+    clk_dst : in  std_logic;
+    rst_n   : in  std_logic;
+    pulse_in: in  std_logic;
+    pulse_out: out std_logic
+  );
+end entity;
+
+architecture rtl of pulse_sync is
+  signal sync1, sync2 : std_logic := '0';
+  signal flag : std_logic := '0';
+begin
+  process(clk_dst, rst_n)
+  begin
+    if rst_n = '0' then
+      sync1 <= '0';
+      sync2 <= '0';
+      flag <= '0';
+      pulse_out <= '0';
+    elsif rising_edge(clk_dst) then
+      sync1 <= pulse_in;
+      sync2 <= sync1;
+      if sync2 = '1' and flag = '0' then
+        pulse_out <= '1';
+        flag <= '1';
+      else
+        pulse_out <= '0';
+      end if;
+      if sync2 = '0' then
+        flag <= '0';
+      end if;
+    end if;
+  end process;
+end architecture;

@@ -1,200 +1,152 @@
-// dma_channel.v
-// Per-channel descriptor-driven DMA engine (scatter-gather).
-// It requests AXI bursts from arbiter and provides data to write or consumes read data.
-// Descriptor format (128-bit):
-// [127:96] reserved/flags
-// [95:64]  transfer_length_bytes (32-bit)
-// [63:32]  dest_or_src_addr (32-bit)  (depending on op)
-// [31:0]   next_descriptor_addr (32-bit) // zero for end-of-chain
-//
-// For simplicity we assume descriptor fetch is handled outside or via descriptor fetcher using the arbiter.
+-- dma_channel.vhd
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
 
-module dma_channel #(
-    parameter ADDR_WIDTH = 32,
-    parameter DATA_WIDTH = 64,
-    parameter DESC_WIDTH = 128
-)(
-    input  wire                   clk,
-    input  wire                   rst_n,
+entity dma_channel is
+  generic (
+    ADDR_WIDTH : integer := 32;
+    DATA_WIDTH : integer := 64;
+    DESC_WIDTH : integer := 128
+  );
+  port (
+    clk       : in  std_logic;
+    rst_n     : in  std_logic;
+    -- control
+    start     : in  std_logic;
+    desc_base : in  std_logic_vector(ADDR_WIDTH-1 downto 0);
+    reset_ch  : in  std_logic;
+    -- arbiter request interface
+    req       : out std_logic;
+    type      : out std_logic_vector(1 downto 0);
+    addr      : out std_logic_vector(ADDR_WIDTH-1 downto 0);
+    burst_len : out std_logic_vector(15 downto 0);
+    wdata     : out std_logic_vector(DATA_WIDTH-1 downto 0);
+    wlast     : out std_logic;
+    grant     : in  std_logic;
+    done      : in  std_logic;
+    error     : in  std_logic;
+    -- status
+    status_out: out std_logic_vector(31 downto 0);
+    -- irq
+    irq_out   : out std_logic
+  );
+end entity;
 
-    // control
-    input  wire                   start,
-    input  wire [ADDR_WIDTH-1:0]  desc_base,
-    input  wire                   reset_ch,
+architecture rtl of dma_channel is
+  type state_t is (IDLE, FETCH_DESC, START_XFER, WAIT_DONE, COMPLETE, ERROR);
+  signal state, next_state : state_t;
 
-    // arbiter request interface
-    output reg                    req,          // request AXI transaction
-    output reg [1:0]              type,         // 0 read, 1 write
-    output reg [ADDR_WIDTH-1:0]   addr,
-    output reg [15:0]             burst_len,
-    output reg [DATA_WIDTH-1:0]   wdata,
-    output reg                    wlast,
-    input  wire                   grant,
-    input  wire                   done,
-    input  wire                   error,
+  signal cur_desc_addr : std_logic_vector(ADDR_WIDTH-1 downto 0);
+  signal cur_desc      : std_logic_vector(DESC_WIDTH-1 downto 0);
+  signal desc_valid    : std_logic;
 
-    // status
-    output reg [31:0]             status_out,
+  signal xfer_len      : unsigned(31 downto 0);
+  signal xfer_addr     : std_logic_vector(ADDR_WIDTH-1 downto 0);
+  signal next_desc     : std_logic_vector(ADDR_WIDTH-1 downto 0);
 
-    // interrupt request output (per-channel)
-    output reg                    irq_out
-);
+  signal bytes_remaining : unsigned(31 downto 0);
+begin
 
-    // Local state machine for descriptor chain processing
-    localparam IDLE  = 0;
-    localparam FETCH_DESC = 1;
-    localparam START_XFER = 2;
-    localparam WAIT_DONE  = 3;
-    localparam COMPLETE   = 4;
-    localparam ERROR      = 5;
+  -- Sequential: state and outputs
+  process(clk, rst_n)
+  begin
+    if rst_n = '0' then
+      state <= IDLE;
+      req <= '0';
+      type <= (others => '0');
+      addr <= (others => '0');
+      burst_len <= (others => '0');
+      wdata <= (others => '0');
+      wlast <= '0';
+      status_out <= (others => '0');
+      irq_out <= '0';
+      cur_desc_addr <= (others => '0');
+      cur_desc <= (others => '0');
+      desc_valid <= '0';
+      xfer_len <= (others => '0');
+      xfer_addr <= (others => '0');
+      next_desc <= (others => '0');
+      bytes_remaining <= (others => '0');
+    elsif rising_edge(clk) then
+      state <= next_state;
 
-    reg [2:0] state, next_state;
+      if grant = '1' then
+        req <= '0';
+      end if;
 
-    reg [ADDR_WIDTH-1:0] cur_desc_addr;
-    reg [DESC_WIDTH-1:0] cur_desc;
-    reg                  desc_valid;
+      if state = COMPLETE then
+        status_out <= std_logic_vector(unsigned(status_out) + 1);
+        irq_out <= '1';
+      else
+        irq_out <= '0';
+      end if;
 
-    // fields extracted from descriptor
-    reg [31:0] xfer_len;
-    reg [ADDR_WIDTH-1:0] xfer_addr;
-    reg [ADDR_WIDTH-1:0] next_desc;
+      if reset_ch = '1' then
+        state <= IDLE;
+        cur_desc_addr <= (others => '0');
+        desc_valid <= '0';
+        bytes_remaining <= (others => '0');
+      end if;
+    end if;
+  end process;
 
-    // For simplicity, implement a local descriptor parser handshake with desc_fetcher via 'req/grant' for descriptor reads.
-    // Here we'll model descriptor fetch as: when state==FETCH_DESC set req=1, type=0 (read) and addr=cur_desc_addr
-    // The arbiter will provide read data via an external path (not modeled fully here). To keep module synthesizable,
-    // we'll assume descriptor fetch completes immediately when grant asserted and done asserted. In a real design,
-    // descriptor fetch would be a read via AXI with R channel returning cur_desc.
+  -- Combinational next-state
+  process(state, start, grant, done, error, cur_desc)
+  begin
+    next_state <= state;
+    case state is
+      when IDLE =>
+        if start = '1' then
+          cur_desc_addr <= desc_base;
+          next_state <= FETCH_DESC;
+        end if;
+      when FETCH_DESC =>
+        req <= '1';
+        type <= "00";
+        addr <= cur_desc_addr;
+        burst_len <= std_logic_vector(to_unsigned((DESC_WIDTH/8) / (DATA_WIDTH/8), 16));
+        if grant = '1' and done = '1' then
+          desc_valid <= '1';
+          xfer_len <= unsigned(cur_desc(95 downto 64));
+          xfer_addr <= cur_desc(63 downto 32);
+          next_desc <= cur_desc(31 downto 0);
+          bytes_remaining <= unsigned(cur_desc(95 downto 64));
+          next_state <= START_XFER;
+        end if;
+      when START_XFER =>
+        if xfer_len = 0 then
+          if next_desc /= (others => '0') then
+            cur_desc_addr <= next_desc;
+            next_state <= FETCH_DESC;
+          else
+            next_state <= COMPLETE;
+          end if;
+        else
+          type <= "00";
+          addr <= xfer_addr;
+          burst_len <= std_logic_vector(to_unsigned((to_integer(xfer_len) + (DATA_WIDTH/8 - 1)) / (DATA_WIDTH/8), 16));
+          req <= '1';
+          if grant = '1' then
+            next_state <= WAIT_DONE;
+          end if;
+        end if;
+      when WAIT_DONE =>
+        if done = '1' then
+          if next_desc /= (others => '0') then
+            cur_desc_addr <= next_desc;
+            next_state <= FETCH_DESC;
+          else
+            next_state <= COMPLETE;
+          end if;
+        elsif error = '1' then
+          next_state <= ERROR;
+        end if;
+      when COMPLETE =>
+        next_state <= IDLE;
+      when ERROR =>
+        next_state <= ERROR;
+    end case;
+  end process;
 
-    // Counters
-    reg [31:0] bytes_remaining;
-
-    // initialize
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state <= IDLE;
-            req <= 1'b0;
-            type <= 2'b00;
-            addr <= {ADDR_WIDTH{1'b0}};
-            burst_len <= 16'd0;
-            wdata <= {DATA_WIDTH{1'b0}};
-            wlast <= 1'b0;
-            status_out <= 32'd0;
-            irq_out <= 1'b0;
-            cur_desc_addr <= {ADDR_WIDTH{1'b0}};
-            cur_desc <= {DESC_WIDTH{1'b0}};
-            desc_valid <= 1'b0;
-            xfer_len <= 32'd0;
-            xfer_addr <= {ADDR_WIDTH{1'b0}};
-            next_desc <= {ADDR_WIDTH{1'b0}};
-            bytes_remaining <= 32'd0;
-        end else begin
-            state <= next_state;
-
-            // clear one-shot request bits when grant seen
-            if (grant) begin
-                req <= 1'b0;
-            end
-
-            // status updates
-            if (state == COMPLETE) begin
-                status_out <= status_out + 1; // count completed transfers (simple)
-                irq_out <= 1'b1;
-            end else begin
-                // one-cycle pulse clear
-                irq_out <= 1'b0;
-            end
-
-            // reset handling
-            if (reset_ch) begin
-                state <= IDLE;
-                cur_desc_addr <= {ADDR_WIDTH{1'b0}};
-                desc_valid <= 1'b0;
-                bytes_remaining <= 32'd0;
-            end
-        end
-    end
-
-    // next state logic (combinational)
-    always @(*) begin
-        next_state = state;
-        case (state)
-            IDLE: begin
-                if (start) begin
-                    cur_desc_addr = desc_base;
-                    next_state = FETCH_DESC;
-                end
-            end
-
-            FETCH_DESC: begin
-                // request descriptor over AXI
-                req = 1'b1;
-                type = 2'b00; // read
-                addr = cur_desc_addr;
-                burst_len = 16'd((DESC_WIDTH/8)/ (DATA_WIDTH/8)); // assuming descriptor fits in burstsize
-                if (grant && done) begin
-                    // in this simplified model, assume data returned in 'cur_desc' externally
-                    desc_valid = 1'b1;
-                    // parse fields (we assume cur_desc is available)
-                    xfer_len = cur_desc[95:64];
-                    xfer_addr = cur_desc[63:32];
-                    next_desc = cur_desc[31:0];
-                    bytes_remaining = cur_desc[95:64];
-                    next_state = START_XFER;
-                end
-            end
-
-            START_XFER: begin
-                // start actual data transfer(s)
-                // decide read or write based on a flag in descriptor (here using top bits as flag)
-                if (xfer_len == 0) begin
-                    // nothing to do, go to next descriptor
-                    if (next_desc != 0) begin
-                        cur_desc_addr = next_desc;
-                        next_state = FETCH_DESC;
-                    end else begin
-                        next_state = COMPLETE;
-                    end
-                end else begin
-                    // for demonstration, assume type=read (0) meaning read from memory -> write to peripheral
-                    type = 2'b00;
-                    addr = xfer_addr;
-                    // compute burst_len in beats: assume simple fixed beat size DATA_WIDTH/8
-                    burst_len = (xfer_len + (DATA_WIDTH/8-1)) / (DATA_WIDTH/8);
-                    req = 1'b1;
-                    if (grant) begin
-                        // wait for arbiter to assert done to indicate transfer finished
-                        next_state = WAIT_DONE;
-                    end
-                end
-            end
-
-            WAIT_DONE: begin
-                // wait for arbiter to report done or error
-                if (done) begin
-                    // update pointer
-                    if (next_desc != 0) begin
-                        cur_desc_addr = next_desc;
-                        next_state = FETCH_DESC;
-                    end else begin
-                        next_state = COMPLETE;
-                    end
-                end else if (error) begin
-                    next_state = ERROR;
-                end
-            end
-
-            COMPLETE: begin
-                // report and return IDLE
-                next_state = IDLE;
-            end
-
-            ERROR: begin
-                // keep error status until reset
-                next_state = ERROR;
-            end
-
-            default: next_state = IDLE;
-        endcase
-    end
-
-endmodule
+end architecture;

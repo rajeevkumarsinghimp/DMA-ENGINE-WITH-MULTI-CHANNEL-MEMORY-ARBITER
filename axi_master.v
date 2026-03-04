@@ -1,58 +1,62 @@
-// axi_master.v
-// NOTE: This is a simplified AXI master skeleton. In the top-level design
-// arbiter wires directly to top-level AXI ports, so this module is optional
-// if your platform provides an AXI interconnect. Kept here for completeness.
+-- axi_master.vhd (skeleton placeholder)
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
 
-module axi_master #(
-    parameter ADDR_WIDTH = 32,
-    parameter DATA_WIDTH = 64
-)(
-    input  wire                   clk,
-    input  wire                   rst_n,
-    // AW
-    output reg [ADDR_WIDTH-1:0]   awaddr,
-    output reg [7:0]              awlen,
-    output reg [2:0]              awsize,
-    output reg [1:0]              awburst,
-    output reg                    awvalid,
-    input  wire                   awready,
-    // W
-    output reg [DATA_WIDTH-1:0]   wdata,
-    output reg [DATA_WIDTH/8-1:0] wstrb,
-    output reg                    wlast,
-    output reg                    wvalid,
-    input  wire                   wready,
-    // B
-    input  wire [1:0]             bresp,
-    input  wire                   bvalid,
-    output reg                    bready,
-    // AR
-    output reg [ADDR_WIDTH-1:0]   araddr,
-    output reg [7:0]              arlen,
-    output reg [2:0]              arsize,
-    output reg [1:0]              arburst,
-    output reg                    arvalid,
-    input  wire                   arready,
-    // R
-    input  wire [DATA_WIDTH-1:0]  rdata,
-    input  wire [1:0]             rresp,
-    input  wire                   rlast,
-    input  wire                   rvalid,
-    output reg                    rready
-);
+entity axi_master is
+  generic (
+    ADDR_WIDTH : integer := 32;
+    DATA_WIDTH : integer := 64
+  );
+  port (
+    clk   : in  std_logic;
+    rst_n : in  std_logic;
+    -- AW
+    awaddr  : out std_logic_vector(ADDR_WIDTH-1 downto 0);
+    awlen   : out std_logic_vector(7 downto 0);
+    awsize  : out std_logic_vector(2 downto 0);
+    awburst : out std_logic_vector(1 downto 0);
+    awvalid : out std_logic;
+    awready : in  std_logic;
+    -- W
+    wdata   : out std_logic_vector(DATA_WIDTH-1 downto 0);
+    wstrb   : out std_logic_vector((DATA_WIDTH/8)-1 downto 0);
+    wlast   : out std_logic;
+    wvalid  : out std_logic;
+    wready  : in  std_logic;
+    -- B
+    bresp   : in  std_logic_vector(1 downto 0);
+    bvalid  : in  std_logic;
+    bready  : out std_logic;
+    -- AR
+    araddr  : out std_logic_vector(ADDR_WIDTH-1 downto 0);
+    arlen   : out std_logic_vector(7 downto 0);
+    arsize  : out std_logic_vector(2 downto 0);
+    arburst : out std_logic_vector(1 downto 0);
+    arvalid : out std_logic;
+    arready : in  std_logic;
+    -- R
+    rdata   : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+    rresp   : in  std_logic_vector(1 downto 0);
+    rlast   : in  std_logic;
+    rvalid  : in  std_logic;
+    rready  : out std_logic
+  );
+end entity;
 
-    // Very-lightweight FSM: this can be expanded to manage IDs, outstanding transactions, etc.
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            awvalid <= 1'b0;
-            wvalid  <= 1'b0;
-            arvalid <= 1'b0;
-            rready  <= 1'b0;
-            bready  <= 1'b0;
-        end else begin
-            // left as an exercise: drive AW/W/AR when requested by master owner
-            // For a simple platform demo you can wire arbiter outputs to the top-level AXI as done previously.
-        end
-    end
-
-endmodule
+architecture rtl of axi_master is
+begin
+  -- Minimal placeholder FSM — integrate with arbiter if you want a standalone master.
+  process(clk, rst_n)
+  begin
+    if rst_n = '0' then
+      awvalid <= '0';
+      wvalid  <= '0';
+      arvalid <= '0';
+      rready  <= '0';
+      bready  <= '0';
+    elsif rising_edge(clk) then
+      -- left as exercise to drive AXI transactions
+    end if;
+  end process;
+end architecture;

@@ -1,232 +1,130 @@
-// arbiter.v
-// Round-robin arbiter that accepts simple transfer requests from multiple channels
-// and drives the AXI master interface. For simplicity each request is treated as a
-// single AXI burst transaction. The arbiter holds ownership of the AXI until the
-// transaction completes (done/asserted).
+-- desc_fetcher.vhd
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
 
-module arbiter #(
-    parameter NUM_CH = 4,
-    parameter ADDR_WIDTH = 32,
-    parameter DATA_WIDTH = 64
-)(
-    input  wire                         clk,
-    input  wire                         rst_n,
+entity desc_fetcher is
+  generic (
+    NUM_CHANNELS : integer := 4;
+    ADDR_WIDTH   : integer := 32;
+    DATA_WIDTH   : integer := 64;
+    FIFO_DEPTH   : integer := 4  -- small FIFO depth
+  );
+  port (
+    clk   : in  std_logic;
+    rst_n : in  std_logic;
 
-    // channel side arrays (vectors of signals)
-    input  wire [NUM_CH-1:0]            ch_req,
-    input  wire [2*NUM_CH-1:0]          ch_type_flat, // flattened types (2 bits per ch)
-    input  wire [NUM_CH*ADDR_WIDTH-1:0] ch_addr_flat,
-    input  wire [NUM_CH*16-1:0]         ch_burst_len_flat,
-    input  wire [NUM_CH*DATA_WIDTH-1:0] ch_wdata_flat,
-    input  wire [NUM_CH-1:0]            ch_wlast_flat,
-    output reg [NUM_CH-1:0]             ch_grant,
-    output reg [NUM_CH-1:0]             ch_done,
-    output reg [NUM_CH-1:0]             ch_error,
+    -- Requests from channels (one-hot)
+    desc_req   : in  std_logic_vector(NUM_CHANNELS-1 downto 0);
+    desc_ack   : out std_logic_vector(NUM_CHANNELS-1 downto 0);
+    desc_addr  : in  std_logic_vector(NUM_CHANNELS*ADDR_WIDTH-1 downto 0);
+    cur_desc   : out std_logic_vector(NUM_CHANNELS*128-1 downto 0); -- 128-bit per channel
+    cur_valid  : out std_logic_vector(NUM_CHANNELS-1 downto 0);
 
-    // AXI master simplified interface (tie-through)
-    output reg [3:0]                    m_axil_awid,
-    output reg [ADDR_WIDTH-1:0]         m_axil_awaddr,
-    output reg [7:0]                    m_axil_awlen,
-    output reg [2:0]                    m_axil_awsize,
-    output reg [1:0]                    m_axil_awburst,
-    output reg                          m_axil_awvalid,
-    input  wire                         m_axil_awready,
+    -- AXI read master connection (simple)
+    m_axi_araddr  : out std_logic_vector(ADDR_WIDTH-1 downto 0);
+    m_axi_arlen   : out std_logic_vector(7 downto 0);
+    m_axi_arsize  : out std_logic_vector(2 downto 0);
+    m_axi_arburst : out std_logic_vector(1 downto 0);
+    m_axi_arvalid : out std_logic;
+    m_axi_arready : in  std_logic;
+    m_axi_rdata   : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+    m_axi_rvalid  : in  std_logic;
+    m_axi_rlast   : in  std_logic;
+    m_axi_rready  : out std_logic
+  );
+end entity;
 
-    output reg [DATA_WIDTH-1:0]         m_axil_wdata,
-    output reg [DATA_WIDTH/8-1:0]       m_axil_wstrb,
-    output reg                          m_axil_wlast,
-    output reg                          m_axil_wvalid,
-    input  wire                         m_axil_wready,
+architecture rtl of desc_fetcher is
+  -- internal state
+  type df_state_t is (DF_IDLE, DF_AR, DF_R);
+  signal state, next_state : df_state_t;
 
-    input  wire [1:0]                   m_axil_bresp,
-    input  wire                         m_axil_bvalid,
-    output reg                          m_axil_bready,
+  constant DESC_WORDS : integer := 128 / DATA_WIDTH;
 
-    output reg [3:0]                    m_axil_arid,
-    output reg [ADDR_WIDTH-1:0]         m_axil_araddr,
-    output reg [7:0]                    m_axil_arlen,
-    output reg [2:0]                    m_axil_arsize,
-    output reg [1:0]                    m_axil_arburst,
-    output reg                          m_axil_arvalid,
-    input  wire                         m_axil_arready,
+  signal active_ch : integer range 0 to NUM_CHANNELS-1 := 0;
+  signal beat_count : integer range 0 to DESC_WORDS := 0;
 
-    input  wire [DATA_WIDTH-1:0]        m_axil_rdata,
-    input  wire [1:0]                   m_axil_rresp,
-    input  wire                         m_axil_rlast,
-    input  wire                         m_axil_rvalid,
-    output reg                          m_axil_rready
-);
+  -- simple single-entry buffers: for clarity we store descriptor into shared arrays
+  signal cur_desc_int : std_logic_vector(NUM_CHANNELS*128-1 downto 0) := (others => '0');
+  signal cur_valid_int: std_logic_vector(NUM_CHANNELS-1 downto 0) := (others => '0');
+  signal desc_ack_int : std_logic_vector(NUM_CHANNELS-1 downto 0) := (others => '0');
 
-    // internal pointers
-    integer idx;
-    reg [clog2(NUM_CH)-1:0] ptr; // current RR pointer
-    reg [clog2(NUM_CH)-1:0] cur_ch;
-    reg busy;
+begin
 
-    // helper: extract per-channel fields from flat arrays
-    function integer clog2;
-        input integer value;
-        integer i;
-        begin
-            clog2=0;
-            for (i=0; 2**i<value; i=i+1) clog2 = i+1;
-        end
-    endfunction
+  -- outputs
+  cur_desc  <= cur_desc_int;
+  cur_valid <= cur_valid_int;
+  desc_ack  <= desc_ack_int;
 
-    // unpack helpers
-    function [1:0] ch_type;
-        input integer ch;
-        begin
-            ch_type = ch_type_flat[(ch*2)+:2];
-        end
-    endfunction
+  -- FSM
+  process(clk, rst_n)
+  begin
+    if rst_n = '0' then
+      state <= DF_IDLE;
+      m_axi_arvalid <= '0';
+      m_axi_rready <= '0';
+      beat_count <= 0;
+      cur_valid_int <= (others => '0');
+      desc_ack_int <= (others => '0');
+      m_axi_araddr <= (others => '0');
+      m_axi_arlen <= std_logic_vector(to_unsigned(DESC_WORDS-1, 8));
+      m_axi_arsize <= std_logic_vector(to_unsigned(integer(log2(real(DATA_WIDTH/8))), 3));
+      m_axi_arburst <= "01";
+    elsif rising_edge(clk) then
+      state <= next_state;
+      case state is
+        when DF_IDLE =>
+          cur_valid_int <= (others => '0');
+          desc_ack_int <= (others => '0');
+          if desc_req /= (others => '0') then
+            -- pick lowest set bit (round-robin or priority can be added)
+            for i in 0 to NUM_CHANNELS-1 loop
+              if desc_req(i) = '1' then
+                active_ch <= i;
+                exit;
+              end if;
+            end loop;
+            m_axi_araddr <= desc_addr((active_ch+1)*ADDR_WIDTH-1 downto active_ch*ADDR_WIDTH);
+            m_axi_arvalid <= '1';
+            m_axi_arlen <= std_logic_vector(to_unsigned(DESC_WORDS-1, 8));
+            m_axi_arburst <= "01";
+            m_axi_arsize <= std_logic_vector(to_unsigned(integer(log2(real(DATA_WIDTH/8))), 3));
+            next_state <= DF_AR;
+          else
+            m_axi_arvalid <= '0';
+            next_state <= DF_IDLE;
+          end if;
+        when DF_AR =>
+          if m_axi_arready = '1' then
+            m_axi_arvalid <= '0';
+            m_axi_rready <= '1';
+            beat_count <= 0;
+            next_state <= DF_R;
+          else
+            next_state <= DF_AR;
+          end if;
+        when DF_R =>
+          if m_axi_rvalid = '1' then
+            -- append beat into descriptor buffer for active_ch
+            -- compute index range to insert
+            variable base_bit : integer := active_ch*128 + beat_count*DATA_WIDTH;
+            cur_desc_int(base_bit + DATA_WIDTH -1 downto base_bit) <= m_axi_rdata;
+            beat_count <= beat_count + 1;
+            if m_axi_rlast = '1' or beat_count+1 = DESC_WORDS then
+              -- descriptor complete
+              cur_valid_int(active_ch) <= '1';
+              desc_ack_int(active_ch) <= '1';
+              m_axi_rready <= '0';
+              next_state <= DF_IDLE;
+            else
+              next_state <= DF_R;
+            end if;
+          else
+            next_state <= DF_R;
+          end if;
+      end case;
+    end if;
+  end process;
 
-    function [ADDR_WIDTH-1:0] ch_addr;
-        input integer ch;
-        begin
-            ch_addr = ch_addr_flat[(ch*ADDR_WIDTH)+:ADDR_WIDTH];
-        end
-    endfunction
-
-    function [15:0] ch_burst_len;
-        input integer ch;
-        begin
-            ch_burst_len = ch_burst_len_flat[(ch*16)+:16];
-        end
-    endfunction
-
-    function [DATA_WIDTH-1:0] ch_wdata;
-        input integer ch;
-        begin
-            ch_wdata = ch_wdata_flat[(ch*DATA_WIDTH)+:DATA_WIDTH];
-        end
-    endfunction
-
-    function ch_wlast_f;
-        input integer ch;
-        begin
-            ch_wlast_f = ch_wlast_flat[ch];
-        end
-    endfunction
-
-    // state machine: simple stepwise arbitration
-    localparam S_IDLE = 0;
-    localparam S_REQ  = 1;
-    localparam S_XFER = 2;
-    localparam S_WAIT_RESP = 3;
-    reg [1:0] state, next_state;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state <= S_IDLE;
-            ptr <= 0;
-            busy <= 1'b0;
-            m_axil_awvalid <= 1'b0;
-            m_axil_wvalid <= 1'b0;
-            m_axil_arvalid <= 1'b0;
-            m_axil_rready <= 1'b0;
-            m_axil_bready <= 1'b0;
-            for (idx=0; idx<NUM_CH; idx=idx+1) begin
-                ch_grant[idx] <= 1'b0;
-                ch_done[idx] <= 1'b0;
-                ch_error[idx] <= 1'b0;
-            end
-        end else begin
-            state <= next_state;
-            // clear done/error pulses
-            for (idx=0; idx<NUM_CH; idx=idx+1) begin
-                ch_done[idx] <= 1'b0;
-                ch_error[idx] <= 1'b0;
-            end
-        end
-    end
-
-    // combinational next-state and outputs
-    always @(*) begin
-        next_state = state;
-        // default idle outputs
-        m_axil_awvalid = 1'b0;
-        m_axil_wvalid  = 1'b0;
-        m_axil_arvalid = 1'b0;
-        m_axil_bready  = 1'b0;
-        m_axil_rready  = 1'b0;
-        for (idx=0; idx<NUM_CH; idx=idx+1) ch_grant[idx] = 1'b0;
-
-        case (state)
-            S_IDLE: begin
-                // round-robin pick next request
-                for (idx=0; idx<NUM_CH; idx=idx+1) begin
-                    integer c = (ptr + idx) % NUM_CH;
-                    if (ch_req[c]) begin
-                        cur_ch = c[clog2(NUM_CH)-1:0];
-                        next_state = S_REQ;
-                        disable for;
-                    end
-                end
-            end
-
-            S_REQ: begin
-                // grant to selected channel and start AXI transaction based on type
-                ch_grant[cur_ch] = 1'b1;
-                // decode fields
-                if (ch_type(cur_ch) == 2'b00) begin
-                    // read: issue AR
-                    m_axil_araddr = ch_addr(cur_ch);
-                    m_axil_arlen  = ch_burst_len(cur_ch) - 1;
-                    m_axil_arsize = clog2(DATA_WIDTH/8);
-                    m_axil_arburst= 2'b01; // INCR
-                    m_axil_arvalid= 1'b1;
-                    if (m_axil_arready) begin
-                        next_state = S_XFER;
-                        m_axil_rready = 1'b1;
-                    end
-                end else begin
-                    // write: issue AW + W beats
-                    m_axil_awaddr = ch_addr(cur_ch);
-                    m_axil_awlen  = ch_burst_len(cur_ch) - 1;
-                    m_axil_awsize = clog2(DATA_WIDTH/8);
-                    m_axil_awburst= 2'b01;
-                    m_axil_awvalid= 1'b1;
-                    if (m_axil_awready) begin
-                        // feed write data in this cycle (simplified)
-                        m_axil_wdata = ch_wdata(cur_ch);
-                        m_axil_wstrb = {DATA_WIDTH/8{1'b1}};
-                        m_axil_wlast = ch_wlast_flat[cur_ch];
-                        m_axil_wvalid = 1'b1;
-                        if (m_axil_wready) begin
-                            next_state = S_WAIT_RESP;
-                            m_axil_bready = 1'b1;
-                        end
-                    end
-                end
-            end
-
-            S_XFER: begin
-                // handle read data until last beat then signal done
-                m_axil_rready = 1'b1;
-                if (m_axil_rvalid && m_axil_rlast) begin
-                    ch_done[cur_ch] = 1'b1;
-                    ptr = cur_ch + 1;
-                    next_state = S_IDLE;
-                end
-            end
-
-            S_WAIT_RESP: begin
-                // wait for write response
-                m_axil_bready = 1'b1;
-                if (m_axil_bvalid) begin
-                    if (m_axil_bresp == 2'b00) begin
-                        ch_done[cur_ch] = 1'b1;
-                    end else begin
-                        ch_error[cur_ch] = 1'b1;
-                    end
-                    ptr = cur_ch + 1;
-                    next_state = S_IDLE;
-                end
-            end
-
-            default: next_state = S_IDLE;
-        endcase
-    end
-
-endmodule
+end architecture;
